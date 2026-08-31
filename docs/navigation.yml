@@ -467,6 +467,10 @@ navigation:
       - section: "Interfaces"
         slug: ""
         contents:
+          - page: "Channels"
+            path: "channels.md"
+            source: "harness"
+            slug: "harness/channels"
           - page: "ACP"
             path: "acp.md"
             source: "harness"
