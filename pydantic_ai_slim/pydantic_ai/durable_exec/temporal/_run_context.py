@@ -47,7 +47,15 @@ _REHYDRATORS: tuple[tuple[str, type[Any], TypeAdapter[Any]], ...] = (
 # the property override below), or falls back to `discovered_tool_names` without one.
 # `realtime_session` is a live session object that cannot cross the boundary, and its contract
 # already makes `None` mean "not available here".
-_NONE_UNLESS_ATTACHED = ('agent', 'root_capability', 'pending_messages', 'tool_manager', 'realtime_session')
+_NONE_UNLESS_ATTACHED = (
+    'agent',
+    'root_capability',
+    'pending_messages',
+    'tool_manager',
+    'realtime_session',
+    '_durable_operations',
+    '_run_capabilities_by_id',
+)
 
 # Defaulted rather than guarded when a payload doesn't carry it. Unlike the guarded fields, the
 # dataclass default can't be mistaken for real run state here: empty means "no anchored evidence",
@@ -110,6 +118,11 @@ class TemporalRunContext(RunContext[AgentDepsT]):
             )
         return super().__getattribute__(name)
 
+    def _expose_field(self, name: str) -> None:
+        """Mark a framework-attached field as readable after deserialization."""
+        instance_fields = object.__getattribute__(self, '__dataclass_fields__')
+        instance_fields[name] = RunContext.__dataclass_fields__[name]
+
     @property
     def available_tool_names(self) -> set[str]:
         """The availability snapshot serialized at activity dispatch time.
@@ -165,12 +178,15 @@ class TemporalRunContext(RunContext[AgentDepsT]):
 
         Tools and event stream handlers run inside activities where the run's event stream isn't
         reachable, so events emitted there can't currently flow back into the stream; raising beats
-        silently dropping them. Events emitted workflow-side (e.g. from capability hooks) work as usual.
+        silently dropping them. This covers a capability's own tools emitting a `CapabilityEvent`,
+        which run in activities like any other tool. Events emitted workflow-side (e.g. from
+        capability hooks) work as usual.
         """
         raise UserError(
             'Emitting events from a tool or event stream handler is not supported under Temporal yet, as '
-            'they run inside activities that cannot reach the run event stream. Emit events from capability '
-            'hooks, which run in the workflow, instead.'
+            'they run inside activities that cannot reach the run event stream. This includes a capability '
+            'emitting a `CapabilityEvent` from one of its own tools. Emit events from capability hooks, '
+            'which run in the workflow, instead.'
         )
 
     @classmethod

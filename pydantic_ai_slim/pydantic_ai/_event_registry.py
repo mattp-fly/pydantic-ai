@@ -31,6 +31,47 @@ _UNKNOWN_TAG = '__unknown__'
 RESERVED_EVENT_TAGS = frozenset({_UNKNOWN_TAG})
 """Tags the family schema uses for its synthetic choices; no event class may register under them."""
 
+_registry_version = 0
+
+
+class EventRegistry(dict[str, Any]):
+    """One event family's tag-to-class registry, versioned so schema caches can detect staleness.
+
+    `event_family_schema` snapshots the registry it builds from, so a schema built before a class
+    registered keeps degrading that class's events to the unknown envelope. That's correct for a
+    schema built once and thrown away, but a consumer that memoizes adapters for the life of a
+    process (e.g. Temporal's payload converter) would keep serving the stale one, making decoding
+    depend on import order. Such consumers key their memo on `event_registry_version()`, which every
+    mutation here bumps, so a later registration rebuilds the adapter instead.
+    """
+
+    def __setitem__(self, tag: str, event_cls: Any) -> None:
+        super().__setitem__(tag, event_cls)
+        _bump_registry_version()
+
+    def __delitem__(self, tag: str) -> None:
+        super().__delitem__(tag)
+        _bump_registry_version()
+
+    def pop(self, tag: str, /, *default: Any) -> Any:
+        popped = super().pop(tag, *default)
+        _bump_registry_version()
+        return popped
+
+
+def _bump_registry_version() -> None:
+    global _registry_version
+    _registry_version += 1
+
+
+def event_registry_version() -> int:
+    """A counter bumped whenever any [`EventRegistry`][] changes.
+
+    Cache keys that include this are invalidated by a registration, so an adapter built before an
+    event class was imported isn't reused after it is.
+    """
+    return _registry_version
+
 
 def is_redefinition(existing: type, cls: type) -> bool:
     """Whether `cls` is the same class as `existing` being defined again.
@@ -40,6 +81,45 @@ def is_redefinition(existing: type, cls: type) -> bool:
     conflict.
     """
     return existing.__module__ == cls.__module__ and existing.__qualname__ == cls.__qualname__
+
+
+_replay_isolation_guard: Callable[[], bool] | None = None
+
+
+def set_replay_isolation_guard(guard: Callable[[], bool]) -> None:
+    """Declare when class definitions are happening in an isolated re-execution of the app's modules.
+
+    A durable execution runtime may re-execute application modules in an isolated interpreter view
+    while sharing `pydantic_ai` itself with the host process — Temporal's workflow sandbox does
+    exactly this. The re-executed copy of an event class is a redefinition of the host's, so left
+    alone it would take over the registry, and the host would then decode payloads into a class its
+    own `isinstance` checks (including `@on_event(MyEvent)` filtering) don't recognize.
+
+    While `guard()` is true, redefinitions keep the class already registered as the family's
+    canonical one. Instances of the re-executed copy still serialize and validate normally: the
+    family schema canonicalizes them (see `event_family_schema`), so application code holds one
+    event class regardless of which side of the boundary it runs on.
+    """
+    global _replay_isolation_guard
+    _replay_isolation_guard = guard
+
+
+def keeps_canonical_registration() -> bool:
+    """Whether a redefinition right now should leave the existing registration in place."""
+    return _replay_isolation_guard is not None and _replay_isolation_guard()
+
+
+def _canonicalize(value: object, event_cls: type) -> Any:
+    """Rebuild a re-executed copy of `event_cls` as `event_cls` itself, so serialization stays exact.
+
+    Only a class the registry considers the same one (see `is_redefinition`) is converted. Such a
+    copy comes from re-executing the same module source, so it carries the same fields by
+    construction, and reading them off it by name is exact.
+    """
+    value_type = type(value)
+    if value_type is event_cls or not is_redefinition(event_cls, value_type):
+        return value
+    return event_cls(**{f.name: getattr(value, f.name) for f in dataclasses.fields(event_cls)})
 
 
 def guard_post_init(cls: type, base_post_init: Callable[[Any], None]) -> None:
@@ -152,9 +232,28 @@ def event_family_schema(
             raise UserError(  # pragma: no cover
                 f'Event class {event_cls.__qualname__} (registered as {tag!r}) must be a dataclass.'
             )
-        choices[tag] = handler.generate_schema(event_cls)
+        choices[tag] = _canonicalizing_schema(handler, event_cls)
     choices[_UNKNOWN_TAG] = unknown_schema
     return pydantic_core.core_schema.tagged_union_schema(choices, discriminator)
+
+
+def _canonicalizing_schema(handler: pydantic.GetCoreSchemaHandler, event_cls: type[Any]) -> Any:
+    """The event class's own schema, serializing a re-executed copy of it as the registered class.
+
+    Under a `set_replay_isolation_guard`, code on the isolated side holds its own copy of the class
+    while the registry keeps the host's. The copy is the same class by every meaning that matters
+    here — same module, same qualname, same fields — so serializing it as the registered one is
+    exact, and it's what lets both sides use the class they imported.
+    """
+
+    def serialize(value: Any, serializer: pydantic_core.core_schema.SerializerFunctionWrapHandler) -> Any:
+        return serializer(_canonicalize(value, event_cls))
+
+    return pydantic_core.core_schema.no_info_before_validator_function(
+        lambda value: value,
+        handler.generate_schema(event_cls),
+        serialization=pydantic_core.core_schema.wrap_serializer_function_ser_schema(serialize),
+    )
 
 
 def _gather_unknown_payload(
