@@ -41,8 +41,13 @@ class EventRegistry(dict[str, Any]):
     registered keeps degrading that class's events to the unknown envelope. That's correct for a
     schema built once and thrown away, but a consumer that memoizes adapters for the life of a
     process (e.g. Temporal's payload converter) would keep serving the stale one, making decoding
-    depend on import order. Such consumers key their memo on `event_registry_version()`, which every
-    mutation here bumps, so a later registration rebuilds the adapter instead.
+    depend on import order. Such consumers key their memo on `event_registry_version()`, which the
+    mutations below bump, so a later registration rebuilds the adapter instead.
+
+    A registry is only ever mutated by item assignment (registration, from `__init_subclass__`),
+    `del`, and `pop` (test cleanup), which is why those are the ones overridden. `dict`'s bulk
+    mutators would change the registry without bumping the version, leaving a memoizing consumer on
+    a stale adapter; register through class definition rather than reaching for them.
     """
 
     def __setitem__(self, tag: str, event_cls: Any) -> None:
@@ -259,15 +264,20 @@ def _canonicalizing_schema(handler: pydantic.GetCoreSchemaHandler, event_cls: ty
 def _gather_unknown_payload(
     tag_field: str, unknown_type: type[Any], envelope_fields: frozenset[str]
 ) -> Callable[[Any], Any]:
-    """Before-validator for the unknown-event envelope: move unrecognized payload fields into `data`."""
+    """Before-validator for the unknown-event envelope: move unrecognized payload fields into `data`.
+
+    The envelope's own `data` slot is synthetic — only this validator ever fills it — so a `data` key
+    on the wire is one of the unknown event's payload fields, not the envelope's, and is gathered
+    like any other. Treating it as the envelope's would let `_flatten_unknown` promote its entries to
+    top-level fields, changing the wire shape of an event whose only payload field is named `data`.
+    """
+    carried_fields = envelope_fields - {'data'}
 
     def gather(value: Any) -> Any:
         if is_str_dict(value):
-            envelope = {k: v for k, v in value.items() if k in envelope_fields}
-            payload = {k: v for k, v in value.items() if k not in envelope_fields}
+            envelope = {k: v for k, v in value.items() if k in carried_fields}
+            payload = {k: v for k, v in value.items() if k not in carried_fields}
             if payload:
-                if (data := envelope.get('data')) is not None:
-                    payload['data'] = data
                 envelope['data'] = payload
             warnings.warn(
                 f'Unknown event {tag_field} {value.get(tag_field)!r}; validating as {unknown_type.__name__}. '
@@ -285,7 +295,8 @@ def _gather_unknown_payload(
 def _flatten_unknown(value: Any, serializer: pydantic_core.core_schema.SerializerFunctionWrapHandler) -> Any:
     """Serializer for the unknown-event envelope: re-flatten `data` so the typed event can be recovered."""
     dumped: Any = serializer(value)
-    if not is_str_dict(dumped):  # pragma: no cover - the family serializer always produces a dict
+    # The family serializer always produces a dict.
+    if not is_str_dict(dumped):  # pragma: no cover
         return dumped
     if is_str_dict(data := dumped.pop('data', None)):
         return {**data, **dumped}
